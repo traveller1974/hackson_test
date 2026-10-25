@@ -97,6 +97,8 @@ async def _get_savings_suggestions() -> dict:
     suggestions = []
     saving = 0.0
     for cat, items in by_cat.items():
+        if cat == "订阅服务":
+            continue  # 兜底分类无法判断是否同类竞品，不做重复付费推断，避免假建议
         if len(items) > 1:
             items.sort(key=lambda x: x["monthly_amount"])
             keep, dup = items[0], items[1:]
@@ -104,8 +106,40 @@ async def _get_savings_suggestions() -> dict:
                 saving += d["monthly_amount"]
                 suggestions.append(
                     f"「{d['name']}」与「{keep['name']}」同属{cat}类，可考虑退掉「{d['name']}」，每月省 {_fmt_money(d['monthly_amount'], currency)}")
+
+    # 闲置识别：对比近 90 天扣款流水，长期无扣款的月付订阅可能是闲置
+    try:
+        txns = await paypal_client.get_transactions(90)
+    except Exception:
+        txns = []
+    if txns:
+        from datetime import date, timedelta
+        today = date.today()
+        last_debit: dict[str, str] = {}
+        for t in txns:
+            tname = (t.get("name") or "").lower()
+            if not tname:
+                continue
+            for s in subs:
+                sname = s["name"].lower()
+                if sname in tname or tname in sname:
+                    if s["name"] not in last_debit or t["date"] > last_debit[s["name"]]:
+                        last_debit[s["name"]] = t["date"]
+        for s in subs:
+            if s.get("billing_interval", "MONTH") != "MONTH":
+                continue  # 非月付订阅没有月度扣款预期，不做闲置判断
+            since = s.get("subscribed_since") or ""
+            if since and since > (today - timedelta(days=60)).isoformat():
+                continue  # 新订阅观察期
+            last = last_debit.get(s["name"])
+            idle_days = (today - date.fromisoformat(last)).days if last else 90
+            if last is None or idle_days >= 45:
+                saving += s["monthly_amount"]
+                suggestions.append(
+                    f"「{s['name']}」已 {idle_days} 天没有扣款记录，可能在闲置，退掉每月可省 {_fmt_money(s['monthly_amount'], currency)}")
+
     return {"potential_monthly_saving": round(saving, 2), "currency": currency,
-            "suggestions": suggestions or ["当前订阅结构健康，没有明显的重复付费。"]}
+            "suggestions": suggestions or ["当前订阅结构健康，没有明显的重复付费或闲置订阅。"]}
 
 _TOOLS = {
     "list_subscriptions": _list_subscriptions,

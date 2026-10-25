@@ -17,7 +17,7 @@ MOCK_TRANSACTIONS = [
     {"transaction_id": "TXN-20261005-002", "subscription_id": "I-5QX41LMK2P", "name": "iQIYI 黄金会员", "amount": 25.00, "currency": "CNY", "date": "2026-10-05", "status": "COMPLETED"},
     {"transaction_id": "TXN-20261005-003", "subscription_id": "I-7TR63VNDQ9", "name": "Spotify Premium", "amount": 19.99, "currency": "CNY", "date": "2026-10-05", "status": "COMPLETED"},
     {"transaction_id": "TXN-20261001-004", "subscription_id": "I-9MVK55PLQ2", "name": "ChatGPT Plus", "amount": 145.00, "currency": "CNY", "date": "2026-10-01", "status": "COMPLETED"},
-    {"transaction_id": "TXN-20261008-005", "subscription_id": "I-2BCK88TNM4", "name": "Claude Pro", "amount": 145.00, "currency": "CNY", "date": "2026-10-08", "status": "COMPLETED"},
+    {"transaction_id": "TXN-20260901-005", "subscription_id": "I-2BCK88TNM4", "name": "Claude Pro", "amount": 145.00, "currency": "CNY", "date": "2026-08-10", "status": "COMPLETED"},
     {"transaction_id": "TXN-20261015-006", "subscription_id": "I-6YDN33PQR7", "name": "Microsoft 365 家庭版", "amount": 79.00, "currency": "CNY", "date": "2026-10-15", "status": "COMPLETED"},
     {"transaction_id": "TXN-20261027-007", "subscription_id": "I-4GHW77KLT5", "name": "Keep 会员", "amount": 15.00, "currency": "CNY", "date": "2026-10-27", "status": "COMPLETED"},
     {"transaction_id": "TXN-20260901-008", "subscription_id": "I-1FTL99XZB6", "name": "Adobe Creative Cloud", "amount": 98.00, "currency": "CNY", "date": "2026-09-20", "status": "COMPLETED"},

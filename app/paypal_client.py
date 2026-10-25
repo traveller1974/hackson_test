@@ -144,6 +144,26 @@ async def _safe_api(method: str, path: str, **kwargs) -> dict | Exception:
         return e
 
 
+# PayPal 商品目录没有 category 字段，分类标签按名称归类（与 mock 数据的分类口径一致）
+_CATEGORY_HINTS = {
+    "streamflix": "视频娱乐", "netflix": "视频娱乐", "iqiyi": "视频娱乐", "爱奇艺": "视频娱乐",
+    "youtube": "视频娱乐", "disney": "视频娱乐", "hbo": "视频娱乐",
+    "musicbox": "音乐", "spotify": "音乐", "音乐": "音乐", "apple music": "音乐",
+    "clouddrive": "云存储", "icloud": "云存储", "dropbox": "云存储", "onedrive": "云存储",
+    "chatgpt": "AI 工具", "claude": "AI 工具", "gemini": "AI 工具", "copilot": "AI 工具",
+    "microsoft": "软件办公", "adobe": "软件办公", "office": "软件办公",
+    "keep": "健身", "健身": "健身",
+}
+
+
+def _guess_category(name: str) -> str:
+    n = name.lower()
+    for key, cat in _CATEGORY_HINTS.items():
+        if key in n:
+            return cat
+    return "订阅服务"
+
+
 def _build_sub(item: dict, plans: dict, products: dict) -> dict:
     plan = plans.get(item.get("plan_id"), {})
     product = products.get(plan.get("product_id", ""), {})
@@ -158,12 +178,13 @@ def _build_sub(item: dict, plans: dict, products: dict) -> dict:
     return {
         "id": item["id"],
         "name": product.get("name") or plan.get("name") or item["id"],
-        "category": "订阅服务",
+        "category": _guess_category(product.get("name") or plan.get("name") or item["id"]),
         "monthly_amount": float(price.get("value") or last_pay.get("value") or 0),
         "currency": price.get("currency_code") or last_pay.get("currency_code") or "USD",
         "status": item.get("status", "UNKNOWN"),
         "next_billing_date": nbt[:10] if nbt else None,
         "subscribed_since": (item.get("create_time") or "")[:10],
+        "billing_interval": ((plan.get("billing_cycles") or [{}])[0].get("frequency") or {}).get("interval_unit", "MONTH"),
     }
 
 
@@ -194,24 +215,42 @@ async def _safe_refresh():
 
 
 async def get_transactions(days: int = 30) -> list[dict]:
+    """扣款流水。PayPal 交易接口单次查询窗口最长 31 天，长跨度按窗口拼接并按流水号去重。"""
     if mode() == "mock":
         return [dict(t) for t in mock_data.MOCK_TRANSACTIONS]
-    from datetime import date, timedelta
-    end = date.today().isoformat()
-    start = (date.today() - timedelta(days=days)).isoformat()
-    data = await _api("GET", "/v1/reporting/transactions", params={
-        "start_date": f"{start}T00:00:00-0700",
-        "end_date": f"{end}T23:59:59-0700",
-        "fields": "all",
-    })
+    from datetime import datetime, timedelta
+
+    now = datetime.now().astimezone()
+    tz = now.strftime("%z")  # 本机时区偏移，如 +0800
+    win_start = (now - timedelta(days=days)).replace(hour=0, minute=0, second=0, microsecond=0)
+    by_id: dict[str, dict] = {}
+    while win_start < now:
+        win_end = min(win_start + timedelta(days=31), now)
+        page, total_pages = 1, 1
+        while page <= total_pages:
+            data = await _api("GET", "/v1/reporting/transactions", params={
+                "start_date": win_start.strftime("%Y-%m-%dT%H:%M:%S") + tz,
+                "end_date": win_end.strftime("%Y-%m-%dT%H:%M:%S") + tz,
+                "fields": "all", "page_size": 100, "page": page,
+            })
+            total_pages = int(data.get("total_pages") or 1)
+            for t in data.get("transaction_details", []):
+                ti = t.get("transaction_info", {})
+                if ti.get("transaction_event_code") == "T1900" or ti.get("transaction_subject") == "Initial balance":
+                    continue  # 账户余额台账，不是扣款
+                key = ti.get("transaction_id") or f"{ti.get('transaction_initiation_date')}{ti.get('transaction_amount')}"
+                by_id[key] = t
+            page += 1
+        win_start = win_end
+    _STATUS = {"S": "Success", "P": "Pending", "V": "Voided", "F": "Failed", "R": "Reversed"}
     return [
         {
-            "transaction_id": t.get("transaction_info", {}).get("transaction_id", ""),
-            "name": t.get("transaction_info", {}).get("transaction_subject", ""),
-            "amount": float(t.get("transaction_info", {}).get("transaction_amount", {}).get("value", "0") or 0),
-            "currency": t.get("transaction_info", {}).get("transaction_amount", {}).get("currency_code", "USD"),
-            "date": (t.get("transaction_info", {}).get("transaction_initiation_date") or "")[:10],
-            "status": t.get("transaction_info", {}).get("transaction_status", ""),
+            "transaction_id": ti.get("transaction_id", ""),
+            "name": ti.get("transaction_subject", "") or ti.get("transaction_note", ""),
+            "amount": float(ti.get("transaction_amount", {}).get("value", "0") or 0),
+            "currency": ti.get("transaction_amount", {}).get("currency_code", "USD"),
+            "date": (ti.get("transaction_initiation_date") or "")[:10],
+            "status": _STATUS.get(ti.get("transaction_status", ""), ti.get("transaction_status", "")),
         }
-        for t in data.get("transaction_details", [])
+        for ti in by_id.values()
     ]
