@@ -1,5 +1,6 @@
 """SubScribe Butler —— 订阅管家 API 服务。"""
 
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -8,7 +9,15 @@ from pydantic import BaseModel
 
 from . import agent, paypal_client
 
-app = FastAPI(title="SubScribe Butler", version="0.1.0")
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    if paypal_client.mode() == "sandbox":
+        paypal_client.start_refresh_loop()  # 后台常驻刷新缓存，页面永远秒开，且不阻塞启动
+    yield
+
+
+app = FastAPI(title="SubScribe Butler", version="0.2.0", lifespan=_lifespan)
 
 
 class ChatIn(BaseModel):

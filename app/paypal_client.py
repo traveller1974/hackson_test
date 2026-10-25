@@ -10,6 +10,7 @@
 - /v1/reporting/transactions       交易流水
 """
 
+import asyncio
 import os
 import time
 
@@ -63,6 +64,49 @@ async def _api(method: str, path: str, **kwargs) -> dict:
 
 # 沙盒目录缓存：新订阅还没有扣款记录，名字和价格要从计划/商品目录取
 _catalog_cache: tuple[float, dict, dict] | None = None
+# 订阅列表缓存：一次仪表盘加载要打 9 个 PayPal 接口，短缓存让页面秒开、网络抖动也不白屏
+_subs_cache: tuple[float, list[dict]] | None = None
+_refresh_task: asyncio.Task | None = None
+_REFRESH_INTERVAL = 25
+
+
+async def _refresh_subs() -> list[dict]:
+    """从 PayPal 拉取订阅全集并重建视图，成功后写缓存。"""
+    global _subs_cache
+    data = await _api("GET", "/v1/billing/subscriptions", params={"page_size": 20})
+    plans, products = await _catalog()
+    # 列表接口只返回 id/status/create_time，plan_id 和账单信息要并行拉详情
+    details = await asyncio.gather(
+        *[_safe_api("GET", f"/v1/billing/subscriptions/{item['id']}") for item in data.get("subscriptions", [])])
+    subs = []
+    for item, d in zip(data.get("subscriptions", []), details):
+        subs.append(_build_sub(d if isinstance(d, dict) else item, plans, products))
+    _subs_cache = (time.time(), subs)
+    return [dict(s) for s in subs]
+
+
+async def _refresh_loop():
+    """常驻后台刷新：仪表盘永远读缓存秒开，数据最多滞后 25 秒。"""
+    while True:
+        try:
+            await _refresh_subs()
+        except Exception:
+            pass  # PayPal 网络抖动时保持旧数据，下一轮再试
+        await asyncio.sleep(_REFRESH_INTERVAL)
+
+
+def start_refresh_loop():
+    global _refresh_task
+    if _refresh_task is None or _refresh_task.done():
+        _refresh_task = asyncio.create_task(_refresh_loop())
+
+
+async def list_subscriptions() -> list[dict]:
+    if mode() == "mock":
+        return [dict(s) for s in _state]
+    if _subs_cache:
+        return [dict(s) for s in _subs_cache[1]]
+    return await _refresh_subs()  # 首次且后台刷新尚未成功时现拉一次
 
 
 async def _catalog() -> tuple[dict, dict]:
@@ -72,59 +116,55 @@ async def _catalog() -> tuple[dict, dict]:
     if _catalog_cache and _catalog_cache[0] > now:
         return _catalog_cache[1], _catalog_cache[2]
     try:
-        plans = {p["id"]: p for p in
-                 (await _api("GET", "/v1/billing/plans", params={"page_size": 20})).get("plans", [])}
+        plans_list = (await _api("GET", "/v1/billing/plans", params={"page_size": 20})).get("plans", [])
     except Exception:
-        plans = {}
-    # 列表接口的计划不含 billing_cycles（拿不到价格），逐个补拉详情
-    for pid, plan in list(plans.items()):
-        if not plan.get("billing_cycles"):
-            try:
-                plans[pid] = await _api("GET", f"/v1/billing/plans/{pid}")
-            except Exception:
-                pass
+        plans_list = []
+    # 列表接口的计划不含 billing_cycles（拿不到价格），并行补拉详情
+    details = await asyncio.gather(
+        *[_safe_api("GET", f"/v1/billing/plans/{p['id']}") for p in plans_list],
+        return_exceptions=True)
+    plans = {p["id"]: p for p in plans_list}
+    for p, d in zip(plans_list, details):
+        if isinstance(d, dict):
+            plans[p["id"]] = d
     try:
         products = {p["id"]: p for p in
                     (await _api("GET", "/v1/catalogs/products", params={"page_size": 20})).get("products", [])}
     except Exception:
         products = {}
-    _catalog_cache = (now + 300, plans, products)
-    return plans, products
+    if plans or products or not _catalog_cache:
+        _catalog_cache = (now + 300, plans, products)
+    return _catalog_cache[1], _catalog_cache[2]
 
 
-async def list_subscriptions() -> list[dict]:
-    if mode() == "mock":
-        return [dict(s) for s in _state]
-    data = await _api("GET", "/v1/billing/subscriptions", params={"page_size": 20})
-    plans, products = await _catalog()
-    subs = []
-    for item in data.get("subscriptions", []):
-        # 列表接口只返回 id/status/create_time，plan_id 和账单信息要逐条拉详情
-        try:
-            item = await _api("GET", f"/v1/billing/subscriptions/{item['id']}")
-        except Exception:
-            pass
-        plan = plans.get(item.get("plan_id"), {})
-        product = products.get(plan.get("product_id", ""), {})
-        price = {}
-        for cycle in plan.get("billing_cycles") or []:
-            fp = (cycle.get("pricing_scheme") or {}).get("fixed_price") or {}
-            if fp:
-                price = fp
-                break
-        last_pay = item.get("billing_info", {}).get("last_payment", {}).get("amount", {})
-        nbt = item.get("billing_info", {}).get("next_billing_time", "")
-        subs.append({
-            "id": item["id"],
-            "name": product.get("name") or plan.get("name") or item["id"],
-            "category": "订阅服务",
-            "monthly_amount": float(price.get("value") or last_pay.get("value") or 0),
-            "currency": price.get("currency_code") or last_pay.get("currency_code") or "USD",
-            "status": item.get("status", "UNKNOWN"),
-            "next_billing_date": nbt[:10] if nbt else None,
-            "subscribed_since": (item.get("create_time") or "")[:10],
-        })
-    return subs
+async def _safe_api(method: str, path: str, **kwargs) -> dict | Exception:
+    try:
+        return await _api(method, path, **kwargs)
+    except Exception as e:
+        return e
+
+
+def _build_sub(item: dict, plans: dict, products: dict) -> dict:
+    plan = plans.get(item.get("plan_id"), {})
+    product = products.get(plan.get("product_id", ""), {})
+    price = {}
+    for cycle in plan.get("billing_cycles") or []:
+        fp = (cycle.get("pricing_scheme") or {}).get("fixed_price") or {}
+        if fp:
+            price = fp
+            break
+    last_pay = item.get("billing_info", {}).get("last_payment", {}).get("amount", {})
+    nbt = item.get("billing_info", {}).get("next_billing_time", "")
+    return {
+        "id": item["id"],
+        "name": product.get("name") or plan.get("name") or item["id"],
+        "category": "订阅服务",
+        "monthly_amount": float(price.get("value") or last_pay.get("value") or 0),
+        "currency": price.get("currency_code") or last_pay.get("currency_code") or "USD",
+        "status": item.get("status", "UNKNOWN"),
+        "next_billing_date": nbt[:10] if nbt else None,
+        "subscribed_since": (item.get("create_time") or "")[:10],
+    }
 
 
 async def cancel_subscription(subscription_id: str) -> dict:
@@ -139,7 +179,18 @@ async def cancel_subscription(subscription_id: str) -> dict:
         return {"ok": False, "error": f"找不到 ID 为 {subscription_id} 的订阅"}
     await _api("POST", f"/v1/billing/subscriptions/{subscription_id}/cancel",
                json={"reason": "Cancelled by SubScribe Butler"})
+    global _subs_cache
+    if _subs_cache:
+        _subs_cache = (0.0, _subs_cache[1])  # 标记为过期，保留数据供页面即时渲染
+    asyncio.create_task(_safe_refresh())
     return {"ok": True, "subscription_id": subscription_id}
+
+
+async def _safe_refresh():
+    try:
+        await _refresh_subs()
+    except Exception:
+        pass
 
 
 async def get_transactions(days: int = 30) -> list[dict]:

@@ -52,6 +52,14 @@ TOOLS_SPEC = [
 
 # ---------------- 工具实现 ----------------
 
+def _currency_of(items: list[dict], default: str = "USD") -> str:
+    """从订阅/交易数据里推断币种（mock 数据是 CNY，真实沙盒多为 USD）。"""
+    for it in items:
+        if it.get("currency"):
+            return it["currency"]
+    return default
+
+
 async def _list_subscriptions() -> dict:
     subs = await paypal_client.list_subscriptions()
     active = [s for s in subs if s["status"] == "ACTIVE"]
@@ -69,7 +77,7 @@ async def _get_monthly_spend() -> dict:
         by_cat[s["category"]] += s["monthly_amount"]
         total += s["monthly_amount"]
     return {
-        "currency": "CNY",
+        "currency": _currency_of(active),
         "monthly_total": round(total, 2),
         "active_count": len(active),
         "by_category": {k: round(v, 2) for k, v in sorted(by_cat.items(), key=lambda x: -x[1])},
@@ -78,10 +86,11 @@ async def _get_monthly_spend() -> dict:
 async def _get_transactions(days: int = 30) -> dict:
     txns = await paypal_client.get_transactions(days)
     total = round(sum(t["amount"] for t in txns), 2)
-    return {"days": days, "total": total, "currency": "CNY", "count": len(txns), "transactions": txns}
+    return {"days": days, "total": total, "currency": _currency_of(txns), "count": len(txns), "transactions": txns}
 
 async def _get_savings_suggestions() -> dict:
     subs = [s for s in await paypal_client.list_subscriptions() if s["status"] == "ACTIVE"]
+    currency = _currency_of(subs)
     by_cat = defaultdict(list)
     for s in subs:
         by_cat[s["category"]].append(s)
@@ -94,8 +103,9 @@ async def _get_savings_suggestions() -> dict:
             for d in dup:
                 saving += d["monthly_amount"]
                 suggestions.append(
-                    f"「{d['name']}」与「{keep['name']}」同属{cat}类，可考虑退掉「{d['name']}」，每月省 {d['monthly_amount']:.2f} 元")
-    return {"potential_monthly_saving": round(saving, 2), "currency": "CNY", "suggestions": suggestions or ["当前订阅结构健康，没有明显的重复付费。"]}
+                    f"「{d['name']}」与「{keep['name']}」同属{cat}类，可考虑退掉「{d['name']}」，每月省 {_fmt_money(d['monthly_amount'], currency)}")
+    return {"potential_monthly_saving": round(saving, 2), "currency": currency,
+            "suggestions": suggestions or ["当前订阅结构健康，没有明显的重复付费。"]}
 
 _TOOLS = {
     "list_subscriptions": _list_subscriptions,
@@ -141,8 +151,9 @@ async def _run_llm(message: str, history: list[dict]) -> str:
 
 # ---------------- 规则引擎兜底 ----------------
 
-def _fmt_money(v: float) -> str:
-    return f"{v:,.2f}".rstrip("0").rstrip(".")
+def _fmt_money(v: float, currency: str = "CNY") -> str:
+    s = f"{v:,.2f}".rstrip("0").rstrip(".")
+    return f"${s}" if currency == "USD" else f"{s} 元"
 
 async def _run_fallback(message: str) -> str:
     subs = await paypal_client.list_subscriptions()
@@ -165,30 +176,30 @@ async def _run_fallback(message: str) -> str:
             return f"想取消哪个订阅呢？当前生效的有：{names}。（也可以在右侧仪表盘直接点「取消」）"
         result = await paypal_client.cancel_subscription(target["id"])
         if result.get("ok"):
-            return f"✅ 已取消「{target['name']}」（{target['id']}），之后不会再扣款了。每月为你省下 {_fmt_money(target['monthly_amount'])} 元。"
+            return f"✅ 已取消「{target['name']}」（{target['id']}），之后不会再扣款了。每月为你省下 {_fmt_money(target['monthly_amount'], target.get('currency', 'USD'))}。"
         return f"取消失败：{result.get('error', '未知错误')}"
 
     if any(k in text for k in ("省", "建议", "优化", "重复")):
         sug = await _get_savings_suggestions()
-        lines = [f"💰 预计每月可省 {sug['currency']} {_fmt_money(sug['potential_monthly_saving'])}："] + \
+        lines = [f"💰 预计每月可省 {_fmt_money(sug['potential_monthly_saving'], sug['currency'])}："] + \
                 [f"· {s}" for s in sug["suggestions"]]
         return "\n".join(lines)
 
     if any(k in text for k in ("流水", "交易", "扣款记录", "最近")):
         tx = await _get_transactions(30)
-        lines = [f"最近 30 天共 {tx['count']} 笔扣款，合计 {_fmt_money(tx['total'])} 元："]
-        lines += [f"· {t['date']}  {t['name']}  {_fmt_money(t['amount'])} 元" for t in tx["transactions"]]
+        lines = [f"最近 30 天共 {tx['count']} 笔扣款，合计 {_fmt_money(tx['total'], tx['currency'])}："]
+        lines += [f"· {t['date']}  {t['name']}  {_fmt_money(t['amount'], t['currency'])}" for t in tx["transactions"]]
         return "\n".join(lines)
 
     if any(k in text for k in ("多少", "花", "开销", "账单", "统计", "汇总", "spend")):
         spend = await _get_monthly_spend()
-        lines = [f"本月订阅开销共 {_fmt_money(spend['monthly_total'])} 元，生效订阅 {spend['active_count']} 个。分类如下："]
-        lines += [f"· {k}：{_fmt_money(v)} 元" for k, v in spend["by_category"].items()]
+        lines = [f"本月订阅开销共 {_fmt_money(spend['monthly_total'], spend['currency'])}，生效订阅 {spend['active_count']} 个。分类如下："]
+        lines += [f"· {k}：{_fmt_money(v, spend['currency'])}" for k, v in spend["by_category"].items()]
         return "\n".join(lines)
 
     if any(k in text for k in ("查", "列表", "都有什么", "有哪些", "订阅", "list")):
         lines = [f"你目前有 {len(active)} 个生效订阅："]
-        lines += [f"· {s['name']}（{s['category']}）：{_fmt_money(s['monthly_amount'])} 元/月，下次扣款 {s['next_billing_date'] or '-'}"
+        lines += [f"· {s['name']}（{s['category']}）：{_fmt_money(s['monthly_amount'], s.get('currency', 'USD'))}/月，下次扣款 {s['next_billing_date'] or '-'}"
                   for s in active]
         return "\n".join(lines)
 
