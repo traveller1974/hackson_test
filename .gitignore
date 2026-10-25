@@ -1,0 +1,9 @@
+# 本地密钥 —— 绝不能进仓库
+.env
+
+# Python 运行产物
+__pycache__/
+*.pyc
+
+# 种子脚本的本地状态（记录已创建的沙盒订阅 ID）
+.seed_state.json
